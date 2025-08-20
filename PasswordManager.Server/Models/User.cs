@@ -16,5 +16,7 @@ namespace PasswordManagerApi.Models
         public string EncryptedVault { get; set; } = string.Empty;
 
         public string MFASecret { get; set; } = string.Empty;
+
+        public bool IsMfaEnabled { get; set; } = false; 
     }
 }

@@ -15,7 +15,7 @@ namespace PasswordManagerApi.Controllers
 {
     [Route("api/[controller]")]
     [ApiController]
-    [EnableRateLimiting("fixed")]  // use rate limiting
+    [EnableRateLimiting("fixed")]
     public class AuthController : ControllerBase
     {
         private readonly ApplicationDbContext _context;
@@ -40,7 +40,7 @@ namespace PasswordManagerApi.Controllers
 
             var hashedPassword = BCrypt.Net.BCrypt.HashPassword(dto.MasterPassword);
 
-            // Tạo MFA secret
+            // Tạo MFA secret nhưng không enable
             var secret = KeyGeneration.GenerateRandomKey(20);
             var mfaSecret = Base32Encoding.ToString(secret);
 
@@ -49,12 +49,13 @@ namespace PasswordManagerApi.Controllers
                 Username = dto.Username,
                 MasterPasswordHash = hashedPassword,
                 EncryptedVault = "",
-                MFASecret = mfaSecret
+                MFASecret = mfaSecret,
+                IsMfaEnabled = false  // Mặc định tắt
             };
 
             _context.Users.Add(user);
             await _context.SaveChangesAsync();
-            return Ok(new { Message = "User registered. Setup MFA with this secret:", MFASecret = mfaSecret });
+            return Ok(new { Message = "User registered. MFA is disabled by default. Use /enable-mfa to enable." });
         }
 
         // POST: api/auth/login
@@ -67,15 +68,18 @@ namespace PasswordManagerApi.Controllers
             if (user == null || !BCrypt.Net.BCrypt.Verify(dto.MasterPassword, user.MasterPasswordHash))
                 return Unauthorized("Invalid credentials.");
 
-            // Verify MFA
-            if (!string.IsNullOrEmpty(user.MFASecret))
+            // Verify MFA chỉ nếu enabled
+            if (user.IsMfaEnabled)
             {
+                if (string.IsNullOrEmpty(dto.MfaCode))
+                    return BadRequest("MFA code required.");
+
                 var totp = new Totp(Base32Encoding.ToBytes(user.MFASecret));
                 if (!totp.VerifyTotp(dto.MfaCode, out long timeStepMatched, VerificationWindow.RfcSpecifiedNetworkDelay))
                     return Unauthorized("Invalid MFA code.");
             }
 
-            // create JWT token
+            // Tạo JWT token
             var claims = new[]
             {
                 new Claim(ClaimTypes.Name, user.Username),
@@ -93,6 +97,59 @@ namespace PasswordManagerApi.Controllers
                 signingCredentials: creds);
 
             return Ok(new { Token = new JwtSecurityTokenHandler().WriteToken(token) });
+        }
+
+        // GET: api/auth/user-info (Lấy status MFA và secret cho QR)
+        [Authorize]
+        [HttpGet("user-info")]
+        public IActionResult GetUserInfo()
+        {
+            var userId = int.Parse(User.FindFirstValue(ClaimTypes.NameIdentifier));
+            var user = _context.Users.Find(userId);
+            if (user == null) return NotFound();
+
+            return Ok(new
+            {
+                IsMfaEnabled = user.IsMfaEnabled,
+                MFASecret = user.MFASecret  // Trả secret để client generate QR
+            });
+        }
+
+        // POST: api/auth/enable-mfa (Enable MFA, require verify code)
+        [Authorize]
+        [HttpPost("enable-mfa")]
+        public async Task<IActionResult> EnableMfa([FromBody] MfaDto dto)
+        {
+            var userId = int.Parse(User.FindFirstValue(ClaimTypes.NameIdentifier));
+            var user = _context.Users.Find(userId);
+            if (user == null) return NotFound();
+
+            if (user.IsMfaEnabled) return BadRequest("MFA already enabled.");
+
+            // Verify code để confirm setup
+            var totp = new Totp(Base32Encoding.ToBytes(user.MFASecret));
+            if (!totp.VerifyTotp(dto.MfaCode, out long timeStepMatched, VerificationWindow.RfcSpecifiedNetworkDelay))
+                return BadRequest("Invalid MFA code for verification.");
+
+            user.IsMfaEnabled = true;
+            await _context.SaveChangesAsync();
+            return Ok("MFA enabled.");
+        }
+
+        // POST: api/auth/disable-mfa (Disable MFA)
+        [Authorize]
+        [HttpPost("disable-mfa")]
+        public async Task<IActionResult> DisableMfa()
+        {
+            var userId = int.Parse(User.FindFirstValue(ClaimTypes.NameIdentifier));
+            var user = _context.Users.Find(userId);
+            if (user == null) return NotFound();
+
+            if (!user.IsMfaEnabled) return BadRequest("MFA already disabled.");
+
+            user.IsMfaEnabled = false;
+            await _context.SaveChangesAsync();
+            return Ok("MFA disabled.");
         }
 
         // GET: api/auth/vault
@@ -118,6 +175,7 @@ namespace PasswordManagerApi.Controllers
             await _context.SaveChangesAsync();
             return Ok("Vault updated.");
         }
+
     }
 
     public class RegisterDto
@@ -130,6 +188,11 @@ namespace PasswordManagerApi.Controllers
     {
         public string Username { get; set; } = string.Empty;
         public string MasterPassword { get; set; } = string.Empty;
-        public string MfaCode { get; set; } = string.Empty;  // add MFA
+        public string MfaCode { get; set; } = string.Empty;  // Optional nếu MFA tắt
+    }
+
+    public class MfaDto
+    {
+        public string MfaCode { get; set; } = string.Empty;
     }
 }
